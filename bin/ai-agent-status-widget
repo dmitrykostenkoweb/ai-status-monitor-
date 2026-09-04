@@ -46,6 +46,9 @@ WIDGET_DIR = Path(__file__).resolve().parent
 UPDATE_SCRIPT = WIDGET_DIR / "ai-agent-status-update"
 USAGE_ANIMATION_INTERVAL_MS = 33
 USAGE_ROTATION_RADIANS_PER_TICK = 0.36 * USAGE_ANIMATION_INTERVAL_MS / 200
+# Breathing room kept between a rescued window and the edge of its monitor.
+OFFSCREEN_MARGIN = 40
+MIN_VISIBLE_HEIGHT = 120
 
 # Per-state palette, taken straight from the design legend.
 STATE_COLORS = {
@@ -1346,6 +1349,47 @@ class StatusWidget(Gtk.Window):
         else:
             log("xdg-open is not available")
 
+    def monitor_workareas(self) -> list[Gdk.Rectangle]:
+        """Work areas of the connected monitors, in virtual-screen coordinates."""
+        display = self.get_display()
+        if display is None:
+            return []
+        areas = []
+        for index in range(display.get_n_monitors()):
+            monitor = display.get_monitor(index)
+            if monitor is not None:
+                areas.append(monitor.get_workarea())
+        return areas
+
+    def clamp_to_visible(self, x: int, y: int) -> tuple[int, int]:
+        """Pull a saved position back onto a monitor that still exists.
+
+        X11 packs every monitor into a single virtual screen, so a layout that is not
+        one plain rectangle leaves dead zones: coordinates the server accepts but no
+        physical panel ever draws. A position saved under an earlier monitor
+        arrangement can end up in such a zone, which leaves the widget running and
+        mapped yet completely invisible. Fall back to the nearest monitor instead.
+        """
+        areas = self.monitor_workareas()
+        if not areas:
+            return x, y
+        for area in areas:
+            if area.x <= x < area.x + area.width and area.y <= y < area.y + area.height:
+                return x, y
+
+        def squared_distance(area: Gdk.Rectangle) -> int:
+            dx = max(area.x - x, 0, x - (area.x + area.width - 1))
+            dy = max(area.y - y, 0, y - (area.y + area.height - 1))
+            return dx * dx + dy * dy
+
+        target = min(areas, key=squared_distance)
+        max_x = max(target.x, target.x + target.width - CARD_WIDTH - OFFSCREEN_MARGIN)
+        max_y = max(target.y, target.y + target.height - MIN_VISIBLE_HEIGHT)
+        clamped_x = min(max(x, target.x + OFFSCREEN_MARGIN), max_x)
+        clamped_y = min(max(y, target.y + OFFSCREEN_MARGIN), max_y)
+        log(f"saved position {x},{y} is off-screen, moved to {clamped_x},{clamped_y}")
+        return clamped_x, clamped_y
+
     def restore_position(self) -> None:
         try:
             data = json.loads(WIDGET_CONFIG.read_text(encoding="utf-8"))
@@ -1353,7 +1397,7 @@ class StatusWidget(Gtk.Window):
             y = int(data.get("y", 80))
         except Exception:
             x, y = 40, 80
-        self.move(x, y)
+        self.move(*self.clamp_to_visible(x, y))
 
     def save_position(self) -> None:
         try:
